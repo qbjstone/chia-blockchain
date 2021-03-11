@@ -116,13 +116,15 @@ async def pre_validate_blocks_multiprocessing(
         if not block_records.contains_block(blocks[0].prev_header_hash):
             return [PreValidationResult(uint16(Err.INVALID_PREV_BLOCK_HASH.value), None, None)]
         curr = block_records.block_record(blocks[0].prev_header_hash)
-        num_sub_slots_to_look_for = 3 if curr.overflow else 2
+
+        # TODO: optimize this logic, some unnecessary blocks are being included
+        num_sub_slots_to_look_for = 4 if curr.overflow else 3
         while (
             curr.sub_epoch_summary_included is None
-            or num_blocks_seen < constants.NUMBER_OF_TIMESTAMPS
+            or num_blocks_seen < 15
             or num_sub_slots_found < num_sub_slots_to_look_for
         ) and curr.height > 0:
-            if num_blocks_seen < constants.NUMBER_OF_TIMESTAMPS or num_sub_slots_found < num_sub_slots_to_look_for:
+            if num_blocks_seen < 15 or num_sub_slots_found < num_sub_slots_to_look_for:
                 recent_blocks_compressed[curr.header_hash] = curr
 
             if curr.first_in_sub_slot:
@@ -146,8 +148,6 @@ async def pre_validate_blocks_multiprocessing(
             constants, len(block.finished_sub_slots) > 0, prev_b, block_records
         )
 
-        if block.reward_chain_block.signage_point_index >= constants.NUM_SPS_SUB_SLOT:
-            log.warning(f"Block: {block.reward_chain_block}")
         overflow = is_overflow_block(constants, block.reward_chain_block.signage_point_index)
         challenge = get_block_challenge(constants, block, BlockCache(recent_blocks), prev_b is None, overflow, False)
         if block.reward_chain_block.challenge_chain_sp_vdf is None:
