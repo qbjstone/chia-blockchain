@@ -1341,11 +1341,7 @@ class FullNode:
         peak_height = self.blockchain.get_peak_height()
 
         # No transactions in mempool in initial client. Remove 6 weeks after launch
-        if (
-            peak_height is None
-            or peak_height <= self.constants.INITIAL_FREEZE_PERIOD
-            or self.constants.NETWORK_TYPE == NetworkType.MAINNET
-        ):
+        if peak_height is None or peak_height <= self.constants.INITIAL_FREEZE_PERIOD:
             return MempoolInclusionStatus.FAILED, Err.INITIAL_TRANSACTION_FREEZE
 
         if self.mempool_manager.seen(spend_name):
