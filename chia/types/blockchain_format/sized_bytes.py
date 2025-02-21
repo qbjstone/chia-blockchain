@@ -1,9 +1,11 @@
-from chia.util.byte_types import make_sized_bytes
+from __future__ import annotations
 
-bytes4 = make_sized_bytes(4)
-bytes8 = make_sized_bytes(8)
-bytes32 = make_sized_bytes(32)
-bytes48 = make_sized_bytes(48)
-bytes96 = make_sized_bytes(96)
-bytes100 = make_sized_bytes(100)
-bytes480 = make_sized_bytes(480)
+import chia_rs.sized_bytes
+
+bytes4 = chia_rs.sized_bytes.bytes4
+bytes8 = chia_rs.sized_bytes.bytes8
+bytes32 = chia_rs.sized_bytes.bytes32
+bytes48 = chia_rs.sized_bytes.bytes48
+bytes96 = chia_rs.sized_bytes.bytes96
+bytes100 = chia_rs.sized_bytes.bytes100
+bytes480 = chia_rs.sized_bytes.bytes480

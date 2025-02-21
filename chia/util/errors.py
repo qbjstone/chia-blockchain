@@ -1,5 +1,12 @@
+# Package: utils
+
+from __future__ import annotations
+
 from enum import Enum
-from typing import Any, List
+from pathlib import Path
+from typing import Any, Optional
+
+from click import ClickException
 
 
 class Err(Enum):
@@ -7,7 +14,7 @@ class Err(Enum):
     DOES_NOT_EXTEND = -1
     BAD_HEADER_SIGNATURE = -2
     MISSING_FROM_STORAGE = -3
-    INVALID_PROTOCOL_MESSAGE = -4
+    INVALID_PROTOCOL_MESSAGE = -4  # We WILL ban for a protocol violation.
     SELF_CONNECTION = -5
     INVALID_HANDSHAKE = -6
     INVALID_ACK = -7
@@ -129,7 +136,8 @@ class Err(Enum):
     INVALID_PREFARM = 104
     ASSERT_SECONDS_RELATIVE_FAILED = 105
     BAD_COINBASE_SIGNATURE = 106
-    INITIAL_TRANSACTION_FREEZE = 107
+
+    # INITIAL_TRANSACTION_FREEZE = 107      # removed
     NO_TRANSACTIONS_WHILE_SYNCING = 108
     ALREADY_INCLUDING_TRANSACTION = 109
     INCOMPATIBLE_NETWORK_ID = 110
@@ -149,22 +157,197 @@ class Err(Enum):
     DOUBLE_SPEND_IN_FORK = 122
 
     INVALID_FEE_TOO_CLOSE_TO_ZERO = 123
+    COIN_AMOUNT_NEGATIVE = 124
+    INTERNAL_PROTOCOL_ERROR = 125
+    INVALID_SPEND_BUNDLE = 126
+    FAILED_GETTING_GENERATOR_MULTIPROCESSING = 127
+
+    ASSERT_BEFORE_SECONDS_ABSOLUTE_FAILED = 128
+    ASSERT_BEFORE_SECONDS_RELATIVE_FAILED = 129
+    ASSERT_BEFORE_HEIGHT_ABSOLUTE_FAILED = 130
+    ASSERT_BEFORE_HEIGHT_RELATIVE_FAILED = 131
+    ASSERT_CONCURRENT_SPEND_FAILED = 132
+    ASSERT_CONCURRENT_PUZZLE_FAILED = 133
+
+    IMPOSSIBLE_SECONDS_RELATIVE_CONSTRAINTS = 134
+    IMPOSSIBLE_SECONDS_ABSOLUTE_CONSTRAINTS = 135
+    IMPOSSIBLE_HEIGHT_RELATIVE_CONSTRAINTS = 136
+    IMPOSSIBLE_HEIGHT_ABSOLUTE_CONSTRAINTS = 137
+
+    ASSERT_MY_BIRTH_SECONDS_FAILED = 138
+    ASSERT_MY_BIRTH_HEIGHT_FAILED = 139
+
+    ASSERT_EPHEMERAL_FAILED = 140
+    EPHEMERAL_RELATIVE_CONDITION = 141
+    # raised if a SOFTFORK condition invokes an unknown extension in mempool
+    # mode
+    INVALID_SOFTFORK_CONDITION = 142
+    # raised if the first argument to the SOFTFORK condition is not a valid
+    # cost. e.g. negative or > UINT64 MAX
+    INVALID_SOFTFORK_COST = 143
+    # raised if a spend issues too many assert spend, assert puzzle,
+    # assert announcement or create announcement
+    TOO_MANY_ANNOUNCEMENTS = 144
+    # the message mode in SEND_MESSAGE or RECEIVE_MESSAGE condition is not valid
+    INVALID_MESSAGE_MODE = 145
+    # the specified coin ID is not valid
+    INVALID_COIN_ID = 146
+    # message not sent/received
+    MESSAGE_NOT_SENT_OR_RECEIVED = 147
 
 
 class ValidationError(Exception):
     def __init__(self, code: Err, error_msg: str = ""):
+        super().__init__(f"Error code: {code.name} {error_msg}")
         self.code = code
         self.error_msg = error_msg
 
 
+class TimestampError(Exception):
+    def __init__(self) -> None:
+        self.code = Err.TIMESTAMP_TOO_FAR_IN_FUTURE
+        super().__init__(f"Error code: {self.code}")
+
+
 class ConsensusError(Exception):
-    def __init__(self, code: Err, errors: List[Any] = []):
-        super(ConsensusError, self).__init__(f"Error code: {code.name}")
+    def __init__(self, code: Err, errors: list[Any] = []):
+        super().__init__(f"Error code: {code.name} {errors}")
+        self.code = code
         self.errors = errors
 
 
 class ProtocolError(Exception):
-    def __init__(self, code: Err, errors: List[Any] = []):
-        super(ProtocolError, self).__init__(f"Error code: {code.name}")
+    def __init__(self, code: Err, errors: list[Any] = []):
+        super().__init__(f"Error code: {code.name} {errors}")
         self.code = code
         self.errors = errors
+
+
+class ApiError(Exception):
+    def __init__(self, code: Err, message: str, data: Optional[bytes] = None):
+        super().__init__(f"{code.name}: {message}")
+        self.code: Err = code
+        self.message: str = message
+        self.data: Optional[bytes] = data
+
+
+##
+#  Keychain errors
+##
+
+
+class KeychainException(Exception):
+    pass
+
+
+class KeychainKeyDataMismatch(KeychainException):
+    def __init__(self, data_type: str):
+        super().__init__(f"KeyData mismatch for: {data_type}")
+
+
+class KeychainIsLocked(KeychainException):
+    pass
+
+
+class KeychainSecretsMissing(KeychainException):
+    pass
+
+
+class KeychainCurrentPassphraseIsInvalid(KeychainException):
+    def __init__(self) -> None:
+        super().__init__("Invalid current passphrase")
+
+
+class KeychainMaxUnlockAttempts(KeychainException):
+    def __init__(self) -> None:
+        super().__init__("maximum passphrase attempts reached")
+
+
+class KeychainNotSet(KeychainException):
+    pass
+
+
+class KeychainIsEmpty(KeychainException):
+    pass
+
+
+class KeychainKeyNotFound(KeychainException):
+    pass
+
+
+class KeychainMalformedRequest(KeychainException):
+    pass
+
+
+class KeychainMalformedResponse(KeychainException):
+    pass
+
+
+class KeychainProxyConnectionFailure(KeychainException):
+    def __init__(self) -> None:
+        super().__init__("Failed to connect to keychain service")
+
+
+class KeychainLockTimeout(KeychainException):
+    pass
+
+
+class KeychainProxyConnectionTimeout(KeychainException):
+    def __init__(self) -> None:
+        super().__init__("Could not reconnect to keychain service in 30 seconds.")
+
+
+class KeychainUserNotFound(KeychainException):
+    def __init__(self, service: str, user: str) -> None:
+        super().__init__(f"user {user!r} not found for service {service!r}")
+
+
+class KeychainFingerprintError(KeychainException):
+    def __init__(self, fingerprint: int, message: str) -> None:
+        self.fingerprint = fingerprint
+        super().__init__(f"fingerprint {str(fingerprint)!r} {message}")
+
+
+class KeychainFingerprintNotFound(KeychainFingerprintError):
+    def __init__(self, fingerprint: int) -> None:
+        super().__init__(fingerprint, "not found")
+
+
+class KeychainFingerprintExists(KeychainFingerprintError):
+    def __init__(self, fingerprint: int) -> None:
+        super().__init__(fingerprint, "already exists")
+
+
+class KeychainLabelError(KeychainException):
+    def __init__(self, label: str, error: str):
+        super().__init__(error)
+        self.label = label
+
+
+class KeychainLabelInvalid(KeychainLabelError):
+    pass
+
+
+class KeychainLabelExists(KeychainLabelError):
+    def __init__(self, label: str, fingerprint: int) -> None:
+        super().__init__(label, f"label {label!r} already exists for fingerprint {str(fingerprint)!r}")
+        self.fingerprint = fingerprint
+
+
+##
+#  Miscellaneous errors
+##
+
+
+class InvalidPathError(Exception):
+    def __init__(self, path: Path, error_message: str):
+        super().__init__(f"{error_message}: {str(path)!r}")
+        self.path = path
+
+
+class CliRpcConnectionError(ClickException):
+    """
+    This error is raised when a rpc server cant be reached by the cli async generator
+    """
+
+    pass
