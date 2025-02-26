@@ -1,200 +1,201 @@
-from typing import Dict, List, Optional, Tuple, Set
+from __future__ import annotations
 
-from blspy import G1Element
+from functools import lru_cache
+from typing import Callable, Union
 
-from chia.types.announcement import Announcement
+from chia_rs import G1Element
+from chia_rs.sized_ints import uint64
+from clvm.casts import int_from_bytes, int_to_bytes
+
 from chia.types.blockchain_format.coin import Coin
-from chia.types.blockchain_format.program import Program, SerializedProgram
+from chia.types.blockchain_format.program import Program
+from chia.types.blockchain_format.serialized_program import SerializedProgram
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.condition_opcodes import ConditionOpcode
 from chia.types.condition_with_args import ConditionWithArgs
-from chia.util.clvm import int_from_bytes
+from chia.types.spend_bundle_conditions import SpendBundleConditions, SpendConditions
 from chia.util.errors import ConsensusError, Err
-from chia.util.ints import uint64
-
-# TODO: review each `assert` and consider replacing with explicit checks
-#       since asserts can be stripped with python `-OO` flag
+from chia.util.hash import std_hash
 
 
-def parse_sexp_to_condition(
-    sexp: Program,
-) -> Tuple[Optional[Err], Optional[ConditionWithArgs]]:
+def parse_sexp_to_condition(sexp: Program) -> ConditionWithArgs:
     """
     Takes a ChiaLisp sexp and returns a ConditionWithArgs.
-    If it fails, returns an Error
+    Raises an ConsensusError if it fails.
     """
-    as_atoms = sexp.as_atom_list()
-    if len(as_atoms) < 1:
-        return Err.INVALID_CONDITION, None
-    opcode = as_atoms[0]
-    try:
-        opcode = ConditionOpcode(opcode)
-    except ValueError:
-        # TODO: this remapping is bad, and should probably not happen
-        # it's simple enough to just store the opcode as a byte
-        opcode = ConditionOpcode.UNKNOWN
-    return None, ConditionWithArgs(opcode, as_atoms[1:])
+    first = sexp.pair
+    if first is None:
+        raise ConsensusError(Err.INVALID_CONDITION, ["first is None"])
+    op = first[0].atom
+    if op is None or len(op) != 1:
+        raise ConsensusError(Err.INVALID_CONDITION, ["invalid op"])
+
+    # since the ConditionWithArgs only has atoms as the args, we can't parse
+    # hints and memos with this function. We just exit the loop if we encounter
+    # a pair instead of an atom
+    vars: list[bytes] = []
+    for arg in Program(first[1]).as_iter():
+        a = arg.atom
+        if a is None:
+            break
+        vars.append(a)
+        # no condition (currently) has more than 3 arguments. Additional
+        # arguments are allowed but ignored
+        if len(vars) > 3:
+            break
+
+    return ConditionWithArgs(ConditionOpcode(op), vars)
 
 
-def parse_sexp_to_conditions(
-    sexp: Program,
-) -> Tuple[Optional[Err], Optional[List[ConditionWithArgs]]]:
+def parse_sexp_to_conditions(sexp: Program) -> list[ConditionWithArgs]:
     """
     Takes a ChiaLisp sexp (list) and returns the list of ConditionWithArgss
-    If it fails, returns as Error
+    Raises an ConsensusError if it fails.
     """
-    results: List[ConditionWithArgs] = []
-    try:
-        for _ in sexp.as_iter():
-            error, cvp = parse_sexp_to_condition(_)
-            if error:
-                return error, None
-            results.append(cvp)  # type: ignore # noqa
-    except ConsensusError:
-        return Err.INVALID_CONDITION, None
-    return None, results
+    return [parse_sexp_to_condition(s) for s in sexp.as_iter()]
 
 
-def conditions_by_opcode(
-    conditions: List[ConditionWithArgs],
-) -> Dict[ConditionOpcode, List[ConditionWithArgs]]:
-    """
-    Takes a list of ConditionWithArgss(CVP) and return dictionary of CVPs keyed of their opcode
-    """
-    d: Dict[ConditionOpcode, List[ConditionWithArgs]] = {}
-    cvp: ConditionWithArgs
-    for cvp in conditions:
-        if cvp.opcode not in d:
-            d[cvp.opcode] = list()
-        d[cvp.opcode].append(cvp)
-    return d
+@lru_cache
+def agg_sig_additional_data(agg_sig_data: bytes) -> dict[ConditionOpcode, bytes]:
+    ret: dict[ConditionOpcode, bytes] = {}
+    for code in [
+        ConditionOpcode.AGG_SIG_PARENT,
+        ConditionOpcode.AGG_SIG_PUZZLE,
+        ConditionOpcode.AGG_SIG_AMOUNT,
+        ConditionOpcode.AGG_SIG_PUZZLE_AMOUNT,
+        ConditionOpcode.AGG_SIG_PARENT_AMOUNT,
+        ConditionOpcode.AGG_SIG_PARENT_PUZZLE,
+    ]:
+        ret[code] = std_hash(agg_sig_data + code)
+
+    ret[ConditionOpcode.AGG_SIG_ME] = agg_sig_data
+    return ret
+
+
+def make_aggsig_final_message(
+    opcode: ConditionOpcode,
+    msg: bytes,
+    spend_conditions: Union[Coin, SpendConditions],
+    agg_sig_additional_data: dict[ConditionOpcode, bytes],
+) -> bytes:
+    if isinstance(spend_conditions, Coin):
+        coin = spend_conditions
+    elif isinstance(spend_conditions, SpendConditions):
+        coin = Coin(spend_conditions.parent_id, spend_conditions.puzzle_hash, uint64(spend_conditions.coin_amount))
+    else:
+        raise ValueError(f"Expected Coin or Spend, got {type(spend_conditions)}")  # pragma: no cover
+
+    COIN_TO_ADDENDUM_F_LOOKUP: dict[ConditionOpcode, Callable[[Coin], bytes]] = {
+        ConditionOpcode.AGG_SIG_PARENT: lambda coin: coin.parent_coin_info,
+        ConditionOpcode.AGG_SIG_PUZZLE: lambda coin: coin.puzzle_hash,
+        ConditionOpcode.AGG_SIG_AMOUNT: lambda coin: int_to_bytes(coin.amount),
+        ConditionOpcode.AGG_SIG_PUZZLE_AMOUNT: lambda coin: coin.puzzle_hash + int_to_bytes(coin.amount),
+        ConditionOpcode.AGG_SIG_PARENT_AMOUNT: lambda coin: coin.parent_coin_info + int_to_bytes(coin.amount),
+        ConditionOpcode.AGG_SIG_PARENT_PUZZLE: lambda coin: coin.parent_coin_info + coin.puzzle_hash,
+        ConditionOpcode.AGG_SIG_ME: lambda coin: coin.name(),
+    }
+    addendum = COIN_TO_ADDENDUM_F_LOOKUP[opcode](coin)
+    return msg + addendum + agg_sig_additional_data[opcode]
+
+
+def pkm_pairs(conditions: SpendBundleConditions, additional_data: bytes) -> tuple[list[G1Element], list[bytes]]:
+    ret: tuple[list[G1Element], list[bytes]] = ([], [])
+
+    data = agg_sig_additional_data(additional_data)
+
+    for pk, msg in conditions.agg_sig_unsafe:
+        ret[0].append(pk)
+        ret[1].append(msg)
+
+    for spend in conditions.spends:
+        condition_items_pairs = [
+            (ConditionOpcode.AGG_SIG_PARENT, spend.agg_sig_parent),
+            (ConditionOpcode.AGG_SIG_PUZZLE, spend.agg_sig_puzzle),
+            (ConditionOpcode.AGG_SIG_AMOUNT, spend.agg_sig_amount),
+            (ConditionOpcode.AGG_SIG_PUZZLE_AMOUNT, spend.agg_sig_puzzle_amount),
+            (ConditionOpcode.AGG_SIG_PARENT_AMOUNT, spend.agg_sig_parent_amount),
+            (ConditionOpcode.AGG_SIG_PARENT_PUZZLE, spend.agg_sig_parent_puzzle),
+            (ConditionOpcode.AGG_SIG_ME, spend.agg_sig_me),
+        ]
+        for condition, items in condition_items_pairs:
+            for pk, msg in items:
+                ret[0].append(pk)
+                ret[1].append(make_aggsig_final_message(condition, msg, spend, data))
+
+    return ret
+
+
+def validate_cwa(cwa: ConditionWithArgs) -> None:
+    if (
+        len(cwa.vars) != 2
+        or len(cwa.vars[0]) != 48
+        or len(cwa.vars[1]) > 1024
+        or cwa.vars[0] is None
+        or cwa.vars[1] is None
+    ):
+        raise ConsensusError(Err.INVALID_CONDITION)
 
 
 def pkm_pairs_for_conditions_dict(
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]], coin_name: bytes32, additional_data: bytes
-) -> List[Tuple[G1Element, bytes]]:
-    assert coin_name is not None
-    ret: List[Tuple[G1Element, bytes]] = []
+    conditions_dict: dict[ConditionOpcode, list[ConditionWithArgs]],
+    coin: Coin,
+    additional_data: bytes,
+) -> list[tuple[G1Element, bytes]]:
+    ret: list[tuple[G1Element, bytes]] = []
+
+    data = agg_sig_additional_data(additional_data)
 
     for cwa in conditions_dict.get(ConditionOpcode.AGG_SIG_UNSAFE, []):
-        assert len(cwa.vars) == 2
-        assert len(cwa.vars[0]) == 48 and len(cwa.vars[1]) <= 1024
-        assert cwa.vars[0] is not None and cwa.vars[1] is not None
+        validate_cwa(cwa)
+        for disallowed in data.values():
+            if cwa.vars[1].endswith(disallowed):
+                raise ConsensusError(Err.INVALID_CONDITION)
         ret.append((G1Element.from_bytes(cwa.vars[0]), cwa.vars[1]))
 
-    for cwa in conditions_dict.get(ConditionOpcode.AGG_SIG_ME, []):
-        assert len(cwa.vars) == 2
-        assert len(cwa.vars[0]) == 48 and len(cwa.vars[1]) <= 1024
-        assert cwa.vars[0] is not None and cwa.vars[1] is not None
-        ret.append((G1Element.from_bytes(cwa.vars[0]), cwa.vars[1] + coin_name + additional_data))
+    for opcode in [
+        ConditionOpcode.AGG_SIG_PARENT,
+        ConditionOpcode.AGG_SIG_PUZZLE,
+        ConditionOpcode.AGG_SIG_AMOUNT,
+        ConditionOpcode.AGG_SIG_PUZZLE_AMOUNT,
+        ConditionOpcode.AGG_SIG_PARENT_AMOUNT,
+        ConditionOpcode.AGG_SIG_PARENT_PUZZLE,
+        ConditionOpcode.AGG_SIG_ME,
+    ]:
+        for cwa in conditions_dict.get(opcode, []):
+            validate_cwa(cwa)
+            ret.append((G1Element.from_bytes(cwa.vars[0]), make_aggsig_final_message(opcode, cwa.vars[1], coin, data)))
+
     return ret
 
 
 def created_outputs_for_conditions_dict(
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]],
+    conditions_dict: dict[ConditionOpcode, list[ConditionWithArgs]],
     input_coin_name: bytes32,
-) -> List[Coin]:
+) -> list[Coin]:
     output_coins = []
     for cvp in conditions_dict.get(ConditionOpcode.CREATE_COIN, []):
-        # TODO: check condition very carefully
-        # (ensure there are the correct number and type of parameters)
-        # maybe write a type-checking framework for conditions
-        # and don't just fail with asserts
         puzzle_hash, amount_bin = cvp.vars[0], cvp.vars[1]
         amount = int_from_bytes(amount_bin)
-        coin = Coin(input_coin_name, puzzle_hash, amount)
+        coin = Coin(input_coin_name, bytes32(puzzle_hash), uint64(amount))
         output_coins.append(coin)
     return output_coins
 
 
-def coin_announcements_for_conditions_dict(
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]],
-    input_coin: Coin,
-) -> Set[Announcement]:
-    output_announcements: Set[Announcement] = set()
-    for cvp in conditions_dict.get(ConditionOpcode.CREATE_COIN_ANNOUNCEMENT, []):
-        message = cvp.vars[0]
-        assert len(message) <= 1024
-        announcement = Announcement(input_coin.name(), message)
-        output_announcements.add(announcement)
-    return output_announcements
-
-
-def puzzle_announcements_for_conditions_dict(
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]],
-    input_coin: Coin,
-) -> Set[Announcement]:
-    output_announcements: Set[Announcement] = set()
-    for cvp in conditions_dict.get(ConditionOpcode.CREATE_PUZZLE_ANNOUNCEMENT, []):
-        message = cvp.vars[0]
-        assert len(message) <= 1024
-        announcement = Announcement(input_coin.puzzle_hash, message)
-        output_announcements.add(announcement)
-    return output_announcements
-
-
-def coin_announcements_names_for_npc(npc_list) -> Set[bytes32]:
-    output_announcements: Set[bytes32] = set()
-    for npc in npc_list:
-        for condition, cvp_list in npc.conditions:
-            if condition == ConditionOpcode.CREATE_COIN_ANNOUNCEMENT:
-                for cvp in cvp_list:
-                    message = cvp.vars[0]
-                    assert len(message) <= 1024
-                    announcement = Announcement(npc.coin_name, message)
-                    output_announcements.add(announcement.name())
-    return output_announcements
-
-
-def puzzle_announcements_names_for_npc(npc_list) -> Set[bytes32]:
-    output_announcements: Set[bytes32] = set()
-    for npc in npc_list:
-        for condition, cvp_list in npc.conditions:
-            if condition == ConditionOpcode.CREATE_PUZZLE_ANNOUNCEMENT:
-                for cvp in cvp_list:
-                    message = cvp.vars[0]
-                    assert len(message) <= 1024
-                    announcement = Announcement(npc.puzzle_hash, message)
-                    output_announcements.add(announcement.name())
-    return output_announcements
-
-
-def coin_announcement_names_for_conditions_dict(
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]],
-    input_coin: Coin,
-) -> List[bytes32]:
-    output = [an.name() for an in coin_announcements_for_conditions_dict(conditions_dict, input_coin)]
-    return output
-
-
-def puzzle_announcement_names_for_conditions_dict(
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]],
-    input_coin: Coin,
-) -> List[bytes32]:
-    output = [an.name() for an in puzzle_announcements_for_conditions_dict(conditions_dict, input_coin)]
-    return output
-
-
 def conditions_dict_for_solution(
-    puzzle_reveal: SerializedProgram,
-    solution: SerializedProgram,
-    max_cost: int,
-) -> Tuple[Optional[Err], Optional[Dict[ConditionOpcode, List[ConditionWithArgs]]], uint64]:
-    error, result, cost = conditions_for_solution(puzzle_reveal, solution, max_cost)
-    if error or result is None:
-        return error, None, uint64(0)
-    return None, conditions_by_opcode(result), cost
+    puzzle_reveal: Union[Program, SerializedProgram], solution: Union[Program, SerializedProgram], max_cost: int
+) -> dict[ConditionOpcode, list[ConditionWithArgs]]:
+    conditions_dict: dict[ConditionOpcode, list[ConditionWithArgs]] = {}
+    for cvp in conditions_for_solution(puzzle_reveal, solution, max_cost):
+        conditions_dict.setdefault(cvp.opcode, list()).append(cvp)
+    return conditions_dict
 
 
 def conditions_for_solution(
-    puzzle_reveal: SerializedProgram,
-    solution: SerializedProgram,
-    max_cost: int,
-) -> Tuple[Optional[Err], Optional[List[ConditionWithArgs]], uint64]:
+    puzzle_reveal: Union[Program, SerializedProgram], solution: Union[Program, SerializedProgram], max_cost: int
+) -> list[ConditionWithArgs]:
     # get the standard script for a puzzle hash and feed in the solution
     try:
-        cost, r = puzzle_reveal.run_with_cost(max_cost, solution)
-        error, result = parse_sexp_to_conditions(r)
-        return error, result, uint64(cost)
-    except Program.EvalError:
-        return Err.SEXP_ERROR, None, uint64(0)
+        _cost, r = puzzle_reveal.run_with_cost(max_cost, solution)
+        return parse_sexp_to_conditions(r)
+    except Program.EvalError as e:
+        raise ConsensusError(Err.SEXP_ERROR, [str(e)]) from e

@@ -1,229 +1,145 @@
-import time
-from typing import Dict, List, Optional, Set
+from __future__ import annotations
 
-from chia.consensus.cost_calculator import NPCResult
-from chia.full_node.generator import create_generator_args, setup_generator_args
+import logging
+from typing import Optional
+
+from chia_puzzles_py.programs import CHIALISP_DESERIALISATION
+from chia_rs import (
+    ConsensusConstants,
+    get_flags_for_height_and_constants,
+    run_chia_program,
+)
+from chia_rs import get_puzzle_and_solution_for_coin2 as get_puzzle_and_solution_for_coin_rust
+from chia_rs.sized_ints import uint32, uint64
+
 from chia.types.blockchain_format.coin import Coin
-from chia.types.blockchain_format.program import NIL
+from chia.types.blockchain_format.program import Program
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.coin_record import CoinRecord
-from chia.types.condition_with_args import ConditionWithArgs
+from chia.types.coin_spend import CoinSpend, CoinSpendWithConditions, SpendInfo, make_spend
 from chia.types.generator_types import BlockGenerator
-from chia.types.name_puzzle_condition import NPC
-from chia.util.clvm import int_from_bytes
-from chia.util.condition_tools import ConditionOpcode, conditions_by_opcode
+from chia.types.spend_bundle_conditions import SpendBundleConditions
+from chia.util.condition_tools import conditions_for_solution
 from chia.util.errors import Err
-from chia.util.ints import uint32, uint64, uint16
-from chia.wallet.puzzles.generator_loader import GENERATOR_FOR_SINGLE_COIN_MOD
-from chia.wallet.puzzles.rom_bootstrap_generator import get_generator
 
-GENERATOR_MOD = get_generator()
+DESERIALIZE_MOD = Program.from_bytes(CHIALISP_DESERIALISATION)
 
 
-def mempool_assert_announcement(condition: ConditionWithArgs, announcements: Set[bytes32]) -> Optional[Err]:
-    """
-    Check if an announcement is included in the list of announcements
-    """
-    announcement_hash = bytes32(condition.vars[0])
-    if announcement_hash not in announcements:
-        return Err.ASSERT_ANNOUNCE_CONSUMED_FAILED
-
-    return None
+log = logging.getLogger(__name__)
 
 
-def mempool_assert_my_coin_id(condition: ConditionWithArgs, unspent: CoinRecord) -> Optional[Err]:
-    """
-    Checks if CoinID matches the id from the condition
-    """
-    if unspent.coin.name() != condition.vars[0]:
-        return Err.ASSERT_MY_COIN_ID_FAILED
-    return None
-
-
-def mempool_assert_absolute_block_height_exceeds(
-    condition: ConditionWithArgs, prev_transaction_block_height: uint32
-) -> Optional[Err]:
-    """
-    Checks if the next block index exceeds the block index from the condition
-    """
+def get_puzzle_and_solution_for_coin(
+    generator: BlockGenerator, coin: Coin, height: int, constants: ConsensusConstants
+) -> SpendInfo:
     try:
-        block_index_exceeds_this = int_from_bytes(condition.vars[0])
-    except ValueError:
-        return Err.INVALID_CONDITION
-    if prev_transaction_block_height < block_index_exceeds_this:
-        return Err.ASSERT_HEIGHT_ABSOLUTE_FAILED
-    return None
-
-
-def mempool_assert_relative_block_height_exceeds(
-    condition: ConditionWithArgs, unspent: CoinRecord, prev_transaction_block_height: uint32
-) -> Optional[Err]:
-    """
-    Checks if the coin age exceeds the age from the condition
-    """
-    try:
-        expected_block_age = int_from_bytes(condition.vars[0])
-        block_index_exceeds_this = expected_block_age + unspent.confirmed_block_index
-    except ValueError:
-        return Err.INVALID_CONDITION
-    if prev_transaction_block_height < block_index_exceeds_this:
-        return Err.ASSERT_HEIGHT_RELATIVE_FAILED
-    return None
-
-
-def mempool_assert_absolute_time_exceeds(condition: ConditionWithArgs, timestamp: uint64) -> Optional[Err]:
-    """
-    Check if the current time in seconds exceeds the time specified by condition
-    """
-    try:
-        expected_seconds = int_from_bytes(condition.vars[0])
-    except ValueError:
-        return Err.INVALID_CONDITION
-
-    if timestamp is None:
-        timestamp = uint64(int(time.time()))
-    if timestamp < expected_seconds:
-        return Err.ASSERT_SECONDS_ABSOLUTE_FAILED
-    return None
-
-
-def mempool_assert_relative_time_exceeds(
-    condition: ConditionWithArgs, unspent: CoinRecord, timestamp: uint64
-) -> Optional[Err]:
-    """
-    Check if the current time in seconds exceeds the time specified by condition
-    """
-    try:
-        expected_seconds = int_from_bytes(condition.vars[0])
-    except ValueError:
-        return Err.INVALID_CONDITION
-
-    if timestamp is None:
-        timestamp = uint64(int(time.time()))
-    if timestamp < expected_seconds + unspent.timestamp:
-        return Err.ASSERT_SECONDS_RELATIVE_FAILED
-    return None
-
-
-def mempool_assert_my_parent_id(condition: ConditionWithArgs, unspent: CoinRecord) -> Optional[Err]:
-    """
-    Checks if coin's parent ID matches the ID from the condition
-    """
-    if unspent.coin.parent_coin_info != condition.vars[0]:
-        return Err.ASSERT_MY_PARENT_ID_FAILED
-    return None
-
-
-def mempool_assert_my_puzzlehash(condition: ConditionWithArgs, unspent: CoinRecord) -> Optional[Err]:
-    """
-    Checks if coin's puzzlehash matches the puzzlehash from the condition
-    """
-    if unspent.coin.puzzle_hash != condition.vars[0]:
-        return Err.ASSERT_MY_PUZZLEHASH_FAILED
-    return None
-
-
-def mempool_assert_my_amount(condition: ConditionWithArgs, unspent: CoinRecord) -> Optional[Err]:
-    """
-    Checks if coin's amount matches the amount from the condition
-    """
-    if unspent.coin.amount != int_from_bytes(condition.vars[0]):
-        return Err.ASSERT_MY_AMOUNT_FAILED
-    return None
-
-
-def get_name_puzzle_conditions(generator: BlockGenerator, max_cost: int, safe_mode: bool) -> NPCResult:
-    try:
-        block_program, block_program_args = setup_generator_args(generator)
-        if safe_mode:
-            cost, result = GENERATOR_MOD.run_safe_with_cost(max_cost, block_program, block_program_args)
-        else:
-            cost, result = GENERATOR_MOD.run_with_cost(max_cost, block_program, block_program_args)
-        npc_list: List[NPC] = []
-        opcodes: Set[bytes] = set(item.value for item in ConditionOpcode)
-
-        for res in result.first().as_iter():
-            conditions_list: List[ConditionWithArgs] = []
-
-            spent_coin_parent_id: bytes32 = res.first().as_atom()
-            spent_coin_puzzle_hash: bytes32 = res.rest().first().as_atom()
-            spent_coin_amount: uint64 = uint64(res.rest().rest().first().as_int())
-            spent_coin: Coin = Coin(spent_coin_parent_id, spent_coin_puzzle_hash, spent_coin_amount)
-
-            for cond in res.rest().rest().rest().first().as_iter():
-                if cond.first().as_atom() in opcodes:
-                    opcode: ConditionOpcode = ConditionOpcode(cond.first().as_atom())
-                elif not safe_mode:
-                    opcode = ConditionOpcode.UNKNOWN
-                else:
-                    return NPCResult(uint16(Err.GENERATOR_RUNTIME_ERROR.value), [], uint64(0))
-                cvl = ConditionWithArgs(opcode, cond.rest().as_atom_list())
-                conditions_list.append(cvl)
-            conditions_dict = conditions_by_opcode(conditions_list)
-            if conditions_dict is None:
-                conditions_dict = {}
-            npc_list.append(
-                NPC(spent_coin.name(), spent_coin.puzzle_hash, [(a, b) for a, b in conditions_dict.items()])
-            )
-        return NPCResult(None, npc_list, uint64(cost))
-    except Exception:
-        return NPCResult(uint16(Err.GENERATOR_RUNTIME_ERROR.value), [], uint64(0))
-
-
-def get_puzzle_and_solution_for_coin(generator: BlockGenerator, coin_name: bytes, max_cost: int):
-    try:
-        block_program = generator.program
-        if not generator.generator_args:
-            block_program_args = NIL
-        else:
-            block_program_args = create_generator_args(generator.generator_refs())
-
-        cost, result = GENERATOR_FOR_SINGLE_COIN_MOD.run_with_cost(
-            max_cost, block_program, block_program_args, coin_name
+        puzzle, solution = get_puzzle_and_solution_for_coin_rust(
+            generator.program,
+            generator.generator_refs,
+            constants.MAX_BLOCK_COST_CLVM,
+            coin,
+            get_flags_for_height_and_constants(height, constants),
         )
-        puzzle = result.first()
-        solution = result.rest().first()
-        return None, puzzle, solution
+        return SpendInfo(puzzle, solution)
     except Exception as e:
-        return e, None, None
+        raise ValueError(f"Failed to get puzzle and solution for coin {coin}, error: {e}") from e
 
 
-def mempool_check_conditions_dict(
-    unspent: CoinRecord,
-    coin_announcement_names: Set[bytes32],
-    puzzle_announcement_names: Set[bytes32],
-    conditions_dict: Dict[ConditionOpcode, List[ConditionWithArgs]],
+def get_spends_for_block(generator: BlockGenerator, height: int, constants: ConsensusConstants) -> list[CoinSpend]:
+    args = bytearray(b"\xff")
+    args += bytes(DESERIALIZE_MOD)
+    args += b"\xff"
+    args += bytes(Program.to(generator.generator_refs))
+    args += b"\x80\x80"
+
+    _, ret = run_chia_program(
+        bytes(generator.program),
+        bytes(args),
+        constants.MAX_BLOCK_COST_CLVM,
+        get_flags_for_height_and_constants(height, constants),
+    )
+
+    spends: list[CoinSpend] = []
+
+    for spend in Program.to(ret).first().as_iter():
+        parent, puzzle, amount, solution = spend.as_iter()
+        puzzle_hash = puzzle.get_tree_hash()
+        coin = Coin(parent.as_atom(), puzzle_hash, uint64(amount.as_int()))
+        spends.append(make_spend(coin, puzzle, solution))
+
+    return spends
+
+
+def get_spends_for_block_with_conditions(
+    generator: BlockGenerator, height: int, constants: ConsensusConstants
+) -> list[CoinSpendWithConditions]:
+    args = bytearray(b"\xff")
+    args += bytes(DESERIALIZE_MOD)
+    args += b"\xff"
+    args += bytes(Program.to(generator.generator_refs))
+    args += b"\x80\x80"
+
+    flags = get_flags_for_height_and_constants(height, constants)
+
+    _, ret = run_chia_program(
+        bytes(generator.program),
+        bytes(args),
+        constants.MAX_BLOCK_COST_CLVM,
+        flags,
+    )
+
+    spends: list[CoinSpendWithConditions] = []
+
+    for spend in Program.to(ret).first().as_iter():
+        parent, puzzle, amount, solution = spend.as_iter()
+        puzzle_hash = puzzle.get_tree_hash()
+        coin = Coin(parent.as_atom(), puzzle_hash, uint64(amount.as_int()))
+        coin_spend = make_spend(coin, puzzle, solution)
+        conditions = conditions_for_solution(puzzle, solution, constants.MAX_BLOCK_COST_CLVM)
+        spends.append(CoinSpendWithConditions(coin_spend, conditions))
+
+    return spends
+
+
+def mempool_check_time_locks(
+    removal_coin_records: dict[bytes32, CoinRecord],
+    bundle_conds: SpendBundleConditions,
     prev_transaction_block_height: uint32,
     timestamp: uint64,
 ) -> Optional[Err]:
     """
-    Check all conditions against current state.
+    Check all time and height conditions against current state.
     """
-    for con_list in conditions_dict.values():
-        cvp: ConditionWithArgs
-        for cvp in con_list:
-            error: Optional[Err] = None
-            if cvp.opcode is ConditionOpcode.ASSERT_MY_COIN_ID:
-                error = mempool_assert_my_coin_id(cvp, unspent)
-            elif cvp.opcode is ConditionOpcode.ASSERT_COIN_ANNOUNCEMENT:
-                error = mempool_assert_announcement(cvp, coin_announcement_names)
-            elif cvp.opcode is ConditionOpcode.ASSERT_PUZZLE_ANNOUNCEMENT:
-                error = mempool_assert_announcement(cvp, puzzle_announcement_names)
-            elif cvp.opcode is ConditionOpcode.ASSERT_HEIGHT_ABSOLUTE:
-                error = mempool_assert_absolute_block_height_exceeds(cvp, prev_transaction_block_height)
-            elif cvp.opcode is ConditionOpcode.ASSERT_HEIGHT_RELATIVE:
-                error = mempool_assert_relative_block_height_exceeds(cvp, unspent, prev_transaction_block_height)
-            elif cvp.opcode is ConditionOpcode.ASSERT_SECONDS_ABSOLUTE:
-                error = mempool_assert_absolute_time_exceeds(cvp, timestamp)
-            elif cvp.opcode is ConditionOpcode.ASSERT_SECONDS_RELATIVE:
-                error = mempool_assert_relative_time_exceeds(cvp, unspent, timestamp)
-            elif cvp.opcode is ConditionOpcode.ASSERT_MY_PARENT_ID:
-                error = mempool_assert_my_parent_id(cvp, unspent)
-            elif cvp.opcode is ConditionOpcode.ASSERT_MY_PUZZLEHASH:
-                error = mempool_assert_my_puzzlehash(cvp, unspent)
-            elif cvp.opcode is ConditionOpcode.ASSERT_MY_AMOUNT:
-                error = mempool_assert_my_amount(cvp, unspent)
-            if error:
-                return error
+
+    if prev_transaction_block_height < bundle_conds.height_absolute:
+        return Err.ASSERT_HEIGHT_ABSOLUTE_FAILED
+    if timestamp < bundle_conds.seconds_absolute:
+        return Err.ASSERT_SECONDS_ABSOLUTE_FAILED
+    if bundle_conds.before_height_absolute is not None:
+        if prev_transaction_block_height >= bundle_conds.before_height_absolute:
+            return Err.ASSERT_BEFORE_HEIGHT_ABSOLUTE_FAILED
+    if bundle_conds.before_seconds_absolute is not None:
+        if timestamp >= bundle_conds.before_seconds_absolute:
+            return Err.ASSERT_BEFORE_SECONDS_ABSOLUTE_FAILED
+
+    for spend in bundle_conds.spends:
+        unspent = removal_coin_records[bytes32(spend.coin_id)]
+        if spend.birth_height is not None:
+            if spend.birth_height != unspent.confirmed_block_index:
+                return Err.ASSERT_MY_BIRTH_HEIGHT_FAILED
+        if spend.birth_seconds is not None:
+            if spend.birth_seconds != unspent.timestamp:
+                return Err.ASSERT_MY_BIRTH_SECONDS_FAILED
+        if spend.height_relative is not None:
+            if prev_transaction_block_height < unspent.confirmed_block_index + spend.height_relative:
+                return Err.ASSERT_HEIGHT_RELATIVE_FAILED
+        if spend.seconds_relative is not None:
+            if timestamp < unspent.timestamp + spend.seconds_relative:
+                return Err.ASSERT_SECONDS_RELATIVE_FAILED
+        if spend.before_height_relative is not None:
+            if prev_transaction_block_height >= unspent.confirmed_block_index + spend.before_height_relative:
+                return Err.ASSERT_BEFORE_HEIGHT_RELATIVE_FAILED
+        if spend.before_seconds_relative is not None:
+            if timestamp >= unspent.timestamp + spend.before_seconds_relative:
+                return Err.ASSERT_BEFORE_SECONDS_RELATIVE_FAILED
 
     return None
